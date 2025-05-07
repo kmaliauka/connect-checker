@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -13,120 +14,116 @@ import (
 	"time"
 )
 
-type ConnectorJob struct {
-	ConnectorName string
-	JobID         int
+type ConnTask struct {
+	connector string
+	taskId    int
 }
 
-type JobResponse struct {
-	ID    int    `json:"id"`
+type TaskResp struct {
+	Id    int    `json:"id"`
 	State string `json:"state"`
 }
 
-type Response struct {
+type Responce struct {
 	State string `json:"state"`
 }
 
-type StatusResponse struct {
-	Connector Response      `json:"connector"`
-	Jobs      []JobResponse `json:"jobs"`
+type StatusResp struct {
+	Connector Responce   `json:"connector"`
+	Tasks     []TaskResp `json:"tasks"`
 }
 
 func main() {
-	kafkaConnectEnv := os.Getenv("KAFKA_CONNECT_URL")
-	kafkaConnectURL := flag.String("host", kafkaConnectEnv, "Kafka Connect URL")
-	checkSleepDuration := flag.Int("sleep", 5, "Check sleep duration")
+	kcenv := os.Getenv("KAFKA_CONNECT_URL")
+	ConnectFmtUrl := flag.String("host", kcenv, "kafka connect ")
+	CheckSleep := flag.Int("duration", 15, "check sleep duration")
 	flag.Parse()
+	fmt.Println(" URL " + *ConnectFmtUrl)
+	fmt.Printf("DURATION BETWEEN CHECK %d mins", *CheckSleep)
 
-	fmt.Println("URL: " + *kafkaConnectURL)
-	fmt.Printf("Duration between checks: %d mins\n", *checkSleepDuration)
-
-	connectURL := *kafkaConnectURL
-	if !strings.HasPrefix(connectURL, "http") {
-		connectURL = "http://" + connectURL
+	var ConUrlMain = *ConnectFmtUrl
+	if !strings.HasPrefix(ConUrlMain, "http") {
+		ConUrlMain = "http://" + ConUrlMain
 	}
-	if strings.HasSuffix(connectURL, "/") {
-		connectURL = strings.TrimSuffix(connectURL, "/")
+	if strings.HasSuffix(ConUrlMain, "/") {
+		ConUrlMain = strings.Trim(ConUrlMain, "/")
 	}
 
-	for {
-		connectors, err := getConnectorsList(connectURL)
+	for true {
+		connectors, err := getConnectorsList(ConUrlMain)
 		if err == nil {
 			for _, connector := range connectors {
-				go handleConnector(connector, connectURL)
+				go ConHandl(connector, ConUrlMain)
 			}
 		} else {
 			log.Println(err)
 		}
-		time.Sleep(time.Duration(*checkSleepDuration) * time.Minute)
+		time.Sleep(time.Duration(*CheckSleep) * time.Minute)
 	}
 }
 
-// Get connector list
-func getConnectorsList(connectURL string) ([]string, error) {
-	url := connectURL + "/connectors"
-	resp, err := http.Get(url)
-	if err != nil {
-		log.Println(err)
-		return nil, err
-	}
-
-	responseData, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
-		log.Println(err)
-		return nil, err
-	}
-
-	return extractConnectors(responseData), nil
-}
-
-func extractConnectors(responseData []byte) []string {
+func getConnectors(responseData []byte) []string {
 	var connectors []string
 	json.Unmarshal(responseData, &connectors)
 	return connectors
 }
 
-func handleConnector(connector string, kafkaConnectURL string) {
-	fmt.Println("Handling connector: " + connector)
-	restartJobs := getJobsToRestart(connector, kafkaConnectURL)
-	for _, job := range restartJobs {
-		go restartConnectorJob(job, kafkaConnectURL)
+func ConHandl(connector string, kafkaConnectHost string) {
+	fmt.Println("Handling " + connector)
+	var doRestart = RestartList(connector, kafkaConnectHost)
+	for _, task := range doRestart {
+		go restartConnTask(task, kafkaConnectHost)
 	}
+
 }
 
-// Get connector statuses
-func getJobsToRestart(connector string, connectURL string) []ConnectorJob {
-	statusURL := connectURL + "/connectors/" + connector + "/status"
-	resp, err := http.Get(statusURL)
+func restartConnTask(task ConnTask, ConUrlMain string) (*http.Response, error) {
+	var url = ConUrlMain + "/connectors/" + task.connector + "/tasks/" + strconv.Itoa(task.taskId) + "/restart"
+	fmt.Println(url)
+	fmt.Printf("Going to restart "+task.connector+":%d", task.taskId)
+	return http.Post(url, "application/json", bytes.NewReader([]byte{}))
+}
+
+func RestartList(connector string, ConUrlMain string) []ConnTask {
+	var statusUrl = ConUrlMain + "/connectors/" + connector + "/status"
+	resp, err := http.Get(statusUrl)
 	if err != nil {
 		log.Println(err)
-		return []ConnectorJob{}
-	}
-
-	responseData, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
-		log.Println(err)
-		return []ConnectorJob{}
-	}
-
-	var status StatusResponse
-	json.Unmarshal(responseData, &status)
-	// Get tasks statuses
-	var jobsToRestart []ConnectorJob
-	if status.Connector.State == "RUNNING" {
-		for _, job := range status.Jobs {
-			if job.State == "FAILED" {
-				jobsToRestart = append(jobsToRestart, ConnectorJob{connector, job.ID})
+		return []ConnTask{}
+	} else {
+		responseData, err := ioutil.ReadAll(resp.Body)
+		if err != nil {
+			log.Println(err)
+			return []ConnTask{}
+		} else {
+			var status StatusResp
+			json.Unmarshal(responseData, &status)
+			var doRestart []ConnTask
+			if status.Connector.State == "RUNNING" {
+				for _, task := range status.Tasks {
+					if task.State == "FAILED" {
+						doRestart = append(doRestart, ConnTask{connector, task.Id})
+					}
+				}
 			}
+			return doRestart
 		}
-	}
 
-	return jobsToRestart
+	}
 }
 
-// Restart running connector task if failed
-func restartConnectorJob(job ConnectorJob, connectURL string) {
-	url := connectURL + "/connectors/" + job.ConnectorName + "/jobs/" + strconv.Itoa(job.JobID) + "/restart"
-	fmt.Println("Restarting job: " + url)
-	fmt.Printf("Going to restart %s:%d\n", job.ConnectorName, job.JobID)
+func getConnectorsList(ConUrlMain string) ([]string, error) {
+	url := ConUrlMain + "/connectors"
+	resp, err := http.Get(url)
+	if err != nil {
+		log.Println(err)
+		return nil, err
+	} else {
+		responseData, err := ioutil.ReadAll(resp.Body)
+		if err != nil {
+			log.Println(err)
+			os.Exit(1)
+		}
+		return getConnectors(responseData), nil
+	}
 }
